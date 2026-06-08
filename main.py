@@ -1,10 +1,11 @@
 import os
+import sqlite3
 import logging
-import threading
-from flask import Flask, jsonify
+from functools import wraps
+from flask import Flask
+from threading import Thread
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
-from web3 import Web3
 
 # --- 1. 基础配置与日志 ---
 logging.basicConfig(
@@ -13,95 +14,135 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 从环境变量获取敏感信息 (请在 Render 后台配置)
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-RPC_PRIMARY = os.environ.get("RPC_URL_PRIMARY")
-RPC_BACKUP = os.environ.get("RPC_URL_BACKUP")
+BOT_TOKEN = os.environ.get("TG_TOKEN")
+ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.isdigit()]
 
 if not BOT_TOKEN:
-    raise ValueError("❌ 未找到 BOT_TOKEN 环境变量，请在 Render 设置中添加。")
+    raise ValueError("❌ 未找到 TG_TOKEN 环境变量，请在 Render 设置中添加。")
 
-# --- 2. Web3 区块链连接逻辑 (含容灾) ---
-def get_web3_instance():
-    """尝试连接主节点，失败则连接备用节点"""
-    # 尝试主节点
-    if RPC_PRIMARY:
-        try:
-            w3 = Web3(Web3.HTTPProvider(RPC_PRIMARY))
-            if w3.is_connected():
-                logger.info(f"✅ 成功连接到主节点: {RPC_PRIMARY[:20]}...")
-                return w3
-        except Exception as e:
-            logger.warning(f"⚠️ 主节点连接失败: {e}")
+# --- 2. 数据库初始化 (SQLite) ---
+def init_db():
+    """初始化数据库，创建监控代币表"""
+    conn = sqlite3.connect('web3_bot.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS monitored_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            token_address TEXT NOT NULL,
+            logo_url TEXT,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    logger.info("✅ 数据库初始化完成")
 
-    # 尝试备用节点
-    if RPC_BACKUP:
-        try:
-            w3 = Web3(Web3.HTTPProvider(RPC_BACKUP))
-            if w3.is_connected():
-                logger.info(f"✅ 成功连接到备用节点: {RPC_BACKUP[:20]}...")
-                return w3
-        except Exception as e:
-            logger.error(f"❌ 备用节点也连接失败: {e}")
+# --- 3. 权限校验装饰器 ---
+def admin_required(func):
+    """装饰器：限制只有管理员才能执行某些命令"""
+    @wraps(func)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in ADMIN_IDS:
+            await update.message.reply_text("🚫 权限不足：仅管理员可执行此操作。")
+            return
+        return await func(update, context)
+    return wrapped
 
-    return None
-
-w3 = get_web3_instance()
-
-# --- 3. Telegram 机器人业务逻辑 ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 欢迎！我是 BSC 链上助手。\n输入 /block 查看最新区块高度。")
-
-async def check_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not w3 or not w3.is_connected():
-        await update.message.reply_text("❌ 无法连接到区块链网络，请稍后再试。")
+# --- 4. Telegram 机器人指令处理 ---
+@admin_required
+async def add_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """添加监控合约"""
+    if not context.args:
+        await update.message.reply_text("⚠️ 用法: /add <合约地址>\n例如: /add 0x1234...5678")
         return
 
-    try:
-        block_num = w3.eth.block_number
-        gas_price = w3.eth.gas_price
-        msg = (f"📊 **BSC 网络状态**\n"
-               f"当前区块: `{block_num}`\n"
-               f"Gas Price: `{Web3.from_wei(gas_price, 'gwei'):.2f} Gwei`")
-        await update.message.reply_text(msg, parse_mode='Markdown')
-    except Exception as e:
-        await update.message.reply_text(f"查询出错: {str(e)}")
+    token_address = context.args[0]
+    chat_id = update.effective_chat.id
 
-# --- 4. Flask 保活服务 (用于响应 Render 和 UptimeRobot) ---
+    conn = sqlite3.connect('web3_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO monitored_tokens (chat_id, token_address) VALUES (?, ?)", (chat_id, token_address))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ 合约 `{token_address}` 已成功加入监控！\n"
+        f"💡 如需添加专属头像，请直接发送 Logo 图片（功能将在后续版本完善）。",
+        parse_mode='Markdown'
+    )
+
+@admin_required
+async def remove_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """删除监控合约"""
+    if not context.args:
+        await update.message.reply_text("⚠️ 用法: /remove <合约地址>")
+        return
+
+    token_address = context.args[0]
+    chat_id = update.effective_chat.id
+
+    conn = sqlite3.connect('web3_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM monitored_tokens WHERE chat_id = ? AND token_address = ?", (chat_id, token_address))
+    conn.commit()
+    affected_rows = cursor.rowcount
+    conn.close()
+
+    if affected_rows > 0:
+        await update.message.reply_text(f"🗑️ 合约 `{token_address}` 已从监控列表中移除。", parse_mode='Markdown')
+    else:
+        await update.message.reply_text("⚠️ 未找到该合约，请检查地址是否正确。")
+
+@admin_required
+async def list_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看当前群组监控的合约列表"""
+    chat_id = update.effective_chat.id
+    conn = sqlite3.connect('web3_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT token_address FROM monitored_tokens WHERE chat_id = ?", (chat_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text("📭 当前群组暂无监控的合约。请使用 /add 添加。")
+        return
+
+    msg = "📊 **当前监控的合约列表:**\n\n"
+    for i, row in enumerate(rows, 1):
+        msg += f"{i}. `{row[0]}`\n"
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+# --- 5. Flask 保活服务 ---
 app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return "Bot is running! 🚀"
+@app.route('/ping')
+def ping():
+    return "Bot is alive!", 200
 
-@app.route('/health')
-def health_check():
-    # UptimeRobot 会定期访问这个地址，返回 200 状态码
-    return jsonify({"status": "ok"}), 200
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
 
-# --- 5. 机器人启动函数 ---
-def run_bot():
-    """在后台线程中运行 Telegram Bot"""
-    try:
-        application = ApplicationBuilder().token(BOT_TOKEN).build()
-        
-        # 注册命令处理器
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("block", check_block))
-        
-        logger.info("🤖 Telegram 机器人正在启动...")
-        application.run_polling() 
-    except Exception as e:
-        logger.error(f"❌ 机器人运行出错: {e}")
-
-# --- 6. 主程序入口 (核心保活逻辑) ---
+# --- 6. 启动入口 ---
 if __name__ == '__main__':
-    # 第一步：启动 Telegram Bot 到后台线程
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    logger.info("✅ Telegram Bot 后台线程已启动")
+    # 1. 初始化数据库
+    init_db()
+
+    # 2. 启动 Flask 保活线程
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("🌐 Flask 保活服务已启动")
+
+    # 3. 启动 Telegram Bot
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # 第二步：在主线程启动 Flask (Render 强制要求主线程监听端口)
-    flask_port = int(os.environ.get("PORT", 5000))
-    logger.info(f"🌐 Flask 保活服务正在启动，监听端口: {flask_port}")
-    app.run(host='0.0.0.0', port=flask_port)
+    # 注册指令处理器
+    application.add_handler(CommandHandler("add", add_token))
+    application.add_handler(CommandHandler("remove", remove_token))
+    application.add_handler(CommandHandler("list", list_tokens))
+
+    logger.info("🤖 Telegram 机器人正在启动...")
+    application.run_polling(drop_pending_updates=True)
