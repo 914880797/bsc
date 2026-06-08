@@ -1,68 +1,107 @@
 import os
 import logging
 import threading
-from flask import Flask, request, jsonify
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from flask import Flask, jsonify
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
+from web3 import Web3
 
-# --- 配置日志 ---
+# --- 1. 基础配置与日志 ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- 环境变量读取 ---
-BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-FLASK_PORT = int(os.environ.get("PORT", 5000)) # Render 强制要求读取 PORT 变量
+# 从环境变量获取敏感信息 (请在 Render 后台配置)
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+RPC_PRIMARY = os.environ.get("RPC_URL_PRIMARY")
+RPC_BACKUP = os.environ.get("RPC_URL_BACKUP")
 
 if not BOT_TOKEN:
-    raise ValueError("未找到 TELEGRAM_BOT_TOKEN 环境变量，请在 Render 设置中添加")
+    raise ValueError("❌ 未找到 BOT_TOKEN 环境变量，请在 Render 设置中添加。")
 
-# --- 初始化 Flask (用于保活和接收 Webhook) ---
+# --- 2. Web3 区块链连接逻辑 (含容灾) ---
+def get_web3_instance():
+    """尝试连接主节点，失败则连接备用节点"""
+    # 尝试主节点
+    if RPC_PRIMARY:
+        try:
+            w3 = Web3(Web3.HTTPProvider(RPC_PRIMARY))
+            if w3.is_connected():
+                logger.info(f"✅ 成功连接到主节点: {RPC_PRIMARY[:20]}...")
+                return w3
+        except Exception as e:
+            logger.warning(f"⚠️ 主节点连接失败: {e}")
+
+    # 尝试备用节点
+    if RPC_BACKUP:
+        try:
+            w3 = Web3(Web3.HTTPProvider(RPC_BACKUP))
+            if w3.is_connected():
+                logger.info(f"✅ 成功连接到备用节点: {RPC_BACKUP[:20]}...")
+                return w3
+        except Exception as e:
+            logger.error(f"❌ 备用节点也连接失败: {e}")
+
+    return None
+
+w3 = get_web3_instance()
+
+# --- 3. Telegram 机器人业务逻辑 ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 欢迎！我是 BSC 链上助手。\n输入 /block 查看最新区块高度。")
+
+async def check_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not w3 or not w3.is_connected():
+        await update.message.reply_text("❌ 无法连接到区块链网络，请稍后再试。")
+        return
+
+    try:
+        block_num = w3.eth.block_number
+        gas_price = w3.eth.gas_price
+        msg = (f"📊 **BSC 网络状态**\n"
+               f"当前区块: `{block_num}`\n"
+               f"Gas Price: `{Web3.from_wei(gas_price, 'gwei'):.2f} Gwei`")
+        await update.message.reply_text(msg, parse_mode='Markdown')
+    except Exception as e:
+        await update.message.reply_text(f"查询出错: {str(e)}")
+
+# --- 4. Flask 保活服务 (用于响应 Render 和 UptimeRobot) ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Service is alive! 🤖"
+    return "Bot is running! 🚀"
 
 @app.route('/health')
 def health_check():
-    # UptimeRobot 可以访问这个地址
+    # UptimeRobot 会定期访问这个地址，返回 200 状态码
     return jsonify({"status": "ok"}), 200
 
-# --- Telegram Bot 逻辑 ---
-async def start(update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello! I am running on Render.")
-
-async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    logger.info(f"收到消息: {text}")
-    await update.message.reply_text(f"Echo: {text}")
-
+# --- 5. 机器人启动函数 ---
 def run_bot():
     """在后台线程中运行 Telegram Bot"""
     try:
         application = ApplicationBuilder().token(BOT_TOKEN).build()
         
-        # 添加处理器
+        # 注册命令处理器
         application.add_handler(CommandHandler("start", start))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        application.add_handler(CommandHandler("block", check_block))
         
-        logger.info("Telegram Bot 正在启动...")
-        # 使用 run_polling() 启动轮询模式
-        # 注意：在 Web Service 中，如果同时有 Flask，建议不要设置 drop_pending_updates=True
-        # 以免丢失启动期间的消息，或者根据需求调整
+        logger.info("🤖 Telegram 机器人正在启动...")
         application.run_polling() 
     except Exception as e:
-        logger.error(f"Bot 运行出错: {e}")
+        logger.error(f"❌ 机器人运行出错: {e}")
 
-# --- 主入口 ---
+# --- 6. 主程序入口 (核心保活逻辑) ---
 if __name__ == '__main__':
-    # 1. 启动 Telegram Bot 到后台线程
+    # 第一步：启动 Telegram Bot 到后台线程
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
+    logger.info("✅ Telegram Bot 后台线程已启动")
     
-    # 2. 在主线程启动 Flask (Render 只检查主线程的端口)
-    logger.info(f"Flask 正在监听端口 {FLASK_PORT}...")
-    app.run(host='0.0.0.0', port=FLASK_PORT)
-
+    # 第二步：在主线程启动 Flask (Render 强制要求主线程监听端口)
+    flask_port = int(os.environ.get("PORT", 5000))
+    logger.info(f"🌐 Flask 保活服务正在启动，监听端口: {flask_port}")
+    app.run(host='0.0.0.0', port=flask_port)
