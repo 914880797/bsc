@@ -1,6 +1,6 @@
 setuptools
 python-telegram-bot==20.7
 Flask==3.0.0
-web3==6.11.4
+web3>=7.0.0  # 升级到最新版
 requests==2.31.0
 gunicorn==21.2.0
